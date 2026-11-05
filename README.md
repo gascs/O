@@ -10,6 +10,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-black.svg)](#)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](#)
 [![Tests](https://img.shields.io/badge/tests-78%20XCTest%20%C2%B7%20204%20SelfTest-brightgreen.svg)](#build--test)
+[![Release](https://img.shields.io/github/v/release/gascs/O?sort=semver)](https://github.com/gascs/O/releases/latest)
 
 </div>
 
@@ -68,7 +69,7 @@ Scanning is streaming and cancellable: background tasks, 150 ms throttled progre
 
 ## Install
 
-**From DMG** — build it locally, then open and drag **O** into Applications:
+**From DMG** — grab the latest build from [Releases](https://github.com/gascs/O/releases/latest) (`O-0.4.0.dmg`, macOS 13+), or build it locally, then open and drag **O** into Applications:
 
 ```bash
 bash build_dmg.sh     # → dist/O-<version>.dmg

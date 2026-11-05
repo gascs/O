@@ -10,6 +10,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-black.svg)](#)
 [![Swift](https://img.shields.io/badge/Swift-6.0-orange.svg)](#)
 [![Tests](https://img.shields.io/badge/tests-78%20XCTest%20%C2%B7%20204%20SelfTest-brightgreen.svg)](#构建与测试)
+[![Release](https://img.shields.io/github/v/release/gascs/O?sort=semver)](https://github.com/gascs/O/releases/latest)
 
 </div>
 
@@ -68,7 +69,7 @@ O 是一个用 SwiftUI 编写的 macOS 磁盘清理与系统工具：看清磁�
 
 ## 安装
 
-**DMG 方式** —— 本地打包后打开，把 **O** 拖入 Applications：
+**DMG 方式** —— 从 [Releases](https://github.com/gascs/O/releases/latest) 下载最新安装包（`O-0.4.0.dmg`，macOS 13+），或本地打包后打开，把 **O** 拖入 Applications：
 
 ```bash
 bash build_dmg.sh     # → dist/O-<版本号>.dmg
