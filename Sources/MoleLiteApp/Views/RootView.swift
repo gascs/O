@@ -84,8 +84,11 @@ struct RootView: View {
             coordinator.requestQuickScan()
         }
         .onReceive(NotificationCenter.default.publisher(for: .oCleanSelected)) { _ in
+            // ⌘⌫ 只负责「切到清理页 + 弹出确认单」，真正删除仍由用户在确认单里点按。
             coordinator.section = .clean
-            Task { await scanModel.cleanSelected() }
+            guard !scanModel.isScanning, !scanModel.isCleaning,
+                  !scanModel.selectedItems.isEmpty else { return }
+            scanModel.showingConfirm = true
         }
         .onReceive(NotificationCenter.default.publisher(for: .oExportReport)) { _ in
             exportReport()

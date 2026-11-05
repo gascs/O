@@ -18,6 +18,14 @@ final class DuplicateViewModel: ObservableObject {
 
     private var scanTask: Task<Void, Never>?
     private var cancellation: ScanCancellation?
+    /// 扫描代次：每次开始 / 取消都自增。旧任务迟到的 progress / 结果 / 错误
+    /// 发现代次不匹配就直接丢弃，不会把新一轮扫描的状态改回「已取消」或旧结果。
+    private var scanGeneration = 0
+
+    /// 已扫描文件数的合并刷新：扫描时回调非常密集，150ms 刷新一次足够。
+    private var countCoalescer = ProgressCoalescer<Int>()
+    private var countFlushTask: Task<Void, Never>?
+
     private let home = FileManager.default.homeDirectoryForCurrentUser
 
     init() {
@@ -64,9 +72,12 @@ final class DuplicateViewModel: ObservableObject {
         let limit = groupLimit
         let cancellation = ScanCancellation()
         self.cancellation = cancellation
+        scanGeneration &+= 1
+        let generation = scanGeneration
         isScanning = true
         message = nil
         scannedFiles = 0
+        countCoalescer.reset()
         groups = []
         selectedIDs = []
 
@@ -76,38 +87,80 @@ final class DuplicateViewModel: ObservableObject {
                 let found = try await DuplicateFinder(roots: roots, minFileSize: minSize, maxGroups: limit).find(
                     cancellation: cancellation,
                     progress: { count in
-                        Task { @MainActor in owner?.scannedFiles = count }
+                        Task { @MainActor in
+                            guard let owner, owner.scanGeneration == generation else { return }
+                            owner.receiveScannedCount(count)
+                        }
                     }
                 )
-                guard let model = owner, !Task.isCancelled else { return }
+                guard let model = owner, !Task.isCancelled, model.scanGeneration == generation else { return }
                 model.apply(found)
             } catch let error as ScanError {
-                owner?.finish(with: error.errorDescription)
+                // 旧任务（用户已取消 / 已重新开始扫描）的 catch 直接 return：
+                // 否则会在这里把新任务的 isScanning 改成 false、message 改成「已取消」。
+                guard let model = owner, !Task.isCancelled, model.scanGeneration == generation else { return }
+                model.finish(with: error.errorDescription)
             } catch {
-                owner?.finish(with: "查找失败：\(error.localizedDescription)")
+                guard let model = owner, !Task.isCancelled, model.scanGeneration == generation else { return }
+                model.finish(with: "查找失败：\(error.localizedDescription)")
             }
         }
     }
 
     func cancel() {
+        // 代次自增让旧任务的迟到回调全部失效（见 startScan 里的代次校验）。
+        scanGeneration &+= 1
         cancellation?.cancel()
+        cancellation = nil
         scanTask?.cancel()
         scanTask = nil
+        countFlushTask?.cancel()
+        countFlushTask = nil
+        countCoalescer.reset()
         isScanning = false
     }
 
+    /// 合并「已扫描文件数」回调：150ms 刷新一次，避免扫描时主线程被高频数字刷新占满。
+    private func receiveScannedCount(_ count: Int) {
+        guard countCoalescer.submit(count) else { return }
+        countFlushTask = Task { [weak self] in
+            let interval = ProgressCoalescer<Int>.recommendedInterval
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            if let latest = self.countCoalescer.flush() {
+                self.scannedFiles = latest
+            }
+            self.countFlushTask = nil
+        }
+    }
+
     private func apply(_ found: [DuplicateGroup]) {
-        groups = found
+        // 有界 Top-N 收集：按「可回收字节」降序只保留前 groupLimit 组，
+        // 单遍插入 O(n·log k)、内存固定 O(k)，收尾才排序一次。
+        // 上游 DuplicateFinder 已按 maxGroups 截断，这里再兜一层，保证列表永远有界。
+        var collector = BoundedTopN<DuplicateGroup>(limit: max(1, groupLimit)) { lhs, rhs in
+            if lhs.reclaimableBytes != rhs.reclaimableBytes {
+                return lhs.reclaimableBytes > rhs.reclaimableBytes
+            }
+            // 次级键：组 id 升序，保证相等时顺序稳定（严格弱序）。
+            return lhs.id < rhs.id
+        }
+        for group in found { collector.insert(group) }
+        let limited = collector.ranked()
+        groups = limited
         isScanning = false
+        countFlushTask?.cancel()
+        countFlushTask = nil
+        countCoalescer.reset()
         // 默认保留每组第一个（按修改时间最新），其余勾选。
         var selection: Set<String> = []
-        for group in found {
+        for group in limited {
             for file in group.files.dropFirst() {
                 selection.insert(file.id)
             }
         }
         selectedIDs = selection
-        if found.isEmpty {
+        if limited.isEmpty {
             message = "没有发现体积 ≥ \(minSizeMB) MB 的重复文件"
         }
     }
@@ -141,11 +194,15 @@ final class DuplicateViewModel: ObservableObject {
     func trashSelected() async {
         let targets = selectedFiles
         guard !targets.isEmpty, !isCleaning else { return }
+        let generation = scanGeneration
         isCleaning = true
         let entries = targets.map { (url: $0.url, size: $0.byteSize) }
         let service = TrashService()
         let report = await Task.detached(priority: .userInitiated) { service.trash(entries: entries) }.value
         isCleaning = false
+
+        // 清理期间可能已经开始新一轮查找：旧结果不要作用在新列表上。
+        guard scanGeneration == generation else { return }
 
         let succeeded = Set(report.outcomes.filter(\.success).map { $0.url.path })
         selectedIDs.subtract(succeeded)

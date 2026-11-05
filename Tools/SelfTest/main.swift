@@ -448,16 +448,20 @@ let missingItem = fileManager.homeDirectoryForCurrentUser.appendingPathComponent
 check("不存在的文件安全跳过", TrashService().trash(entries: [(missingItem, 0)]).successCount == 1)
 
 // 真实移动：在 ~/Library/Caches 内创建 4KB 临时文件 → 移入废纸篓 → 校验 → 清理测试产物。
+// 沙箱 / 只读主目录的 CI 环境允许跳过，不把环境限制计为失败。
 let marker = fileManager.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Caches/MoleLiteSelfTest-\(UUID().uuidString).txt")
-fileManager.createFile(atPath: marker.path, contents: Data(count: 4096))
-let realReport = TrashService().trash(entries: [(marker, 4096)])
-check("真实移入废纸篓成功", realReport.successCount == 1 && !fileManager.fileExists(atPath: marker.path))
-if let trashedURL = realReport.outcomes.first?.resultingURL {
-    check("可在废纸篓中定位", fileManager.fileExists(atPath: trashedURL.path))
-    try? fileManager.removeItem(at: trashedURL)
+if fileManager.createFile(atPath: marker.path, contents: Data(count: 4096)) {
+    let realReport = TrashService().trash(entries: [(marker, 4096)])
+    check("真实移入废纸篓成功", realReport.successCount == 1 && !fileManager.fileExists(atPath: marker.path))
+    if let trashedURL = realReport.outcomes.first?.resultingURL {
+        check("可在废纸篓中定位", fileManager.fileExists(atPath: trashedURL.path))
+        try? fileManager.removeItem(at: trashedURL)
+    } else {
+        check("可在废纸篓中定位", false)
+    }
 } else {
-    check("可在废纸篓中定位", false)
+    print("  注：当前环境不允许写入 ~/Library/Caches，跳过真实废纸篓往返检查")
 }
 
 print("\n— 登录启动状态映射 —")
@@ -517,15 +521,18 @@ check("激活通知名稳定", InstanceGuard.activationNotificationName == "com.
 
 print("\n— 清理规则与扩围扫描 —")
 check("保守预设 5 条规则", CleanupRuleCatalog.conservative.count == 5)
-check("标准预设 26 条规则", CleanupRuleCatalog.standard.count == 26)
-check("激进预设 33 条规则", CleanupRuleCatalog.aggressive.count == 33)
+check("标准预设 47 条规则", CleanupRuleCatalog.standard.count == 47)
+check("激进预设 58 条规则", CleanupRuleCatalog.aggressive.count == 58)
+check("标准预设包含生态规则",
+      CleanupRuleCatalog.standard.contains { $0.id.hasPrefix("eco.") })
 check("激进预设包含个人文件来源",
       CleanupRuleCatalog.aggressive.contains { $0.category == .userFiles })
 check("预设规则 id 不重复",
       Set(CleanupRuleCatalog.aggressive.map(\.id)).count == CleanupRuleCatalog.aggressive.count)
 
-let ruleHome = fileManager.homeDirectoryForCurrentUser
-    .appendingPathComponent(".o-selftest-rules-\(UUID().uuidString)")
+// 规则校验只需要一个「主目录」语义的路径，用系统临时目录即可，避免污染真实 $HOME。
+let ruleHome = fileManager.temporaryDirectory
+    .appendingPathComponent("o-selftest-rules-\(UUID().uuidString)")
 try? fileManager.createDirectory(at: ruleHome, withIntermediateDirectories: true)
 defer { try? fileManager.removeItem(at: ruleHome) }
 

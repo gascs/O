@@ -49,6 +49,7 @@ struct ScannerView: View {
             ConfirmCleanSheet(
                 items: model.selectedItems,
                 totalBytes: model.selectedBytes,
+                permanentlyDeletes: model.selectionIncludesTrash,
                 onConfirm: {
                     model.showingConfirm = false
                     Task { await model.cleanSelected() }
@@ -100,8 +101,8 @@ struct ScannerView: View {
 
     private var headerSubtitle: String {
         if model.isScanning { return "正在扫描，可随时取消；结果按分类逐步出现" }
-        guard let report = model.report else { return "扫描缓存、日志、Xcode 与废纸篓；清理仅移入废纸篓" }
-        return String(format: "上次扫描 %d 项 · 用时 %.1f 秒 · 清理仅移入废纸篓", report.scannedItemCount, report.duration)
+        guard let report = model.report else { return "扫描缓存、日志、Xcode 与废纸篓；清理默认移入废纸篓" }
+        return String(format: "上次扫描 %d 项 · 用时 %.1f 秒 · 清理默认移入废纸篓", report.scannedItemCount, report.duration)
     }
 
     // MARK: - 控制条
@@ -161,7 +162,7 @@ struct ScannerView: View {
             EmptyState(
                 icon: "trash",
                 title: "准备开始扫描",
-                message: "统计缓存、日志、Xcode 数据与废纸篓体积；清理只移入废纸篓，可随时恢复。",
+                message: "统计缓存、日志、Xcode 数据与废纸篓体积；清理默认移入废纸篓，废纸篓内容可显式永久删除。",
                 actionTitle: "开始扫描",
                 action: { model.startScan() }
             )
@@ -269,7 +270,7 @@ struct ScannerView: View {
 
     private var footer: some View {
         HStack(spacing: DesignSpec.space3) {
-            Text("清理仅移入废纸篓，可在废纸篓中恢复")
+            Text("清理仅移入废纸篓，可在废纸篓中恢复；废纸篓内的条目将永久删除，不可恢复")
                 .font(M2Font.body(10))
                 .foregroundStyle(M2.secondary)
                 .lineLimit(1)
@@ -586,6 +587,8 @@ private struct ItemTableRow: View {
 struct ConfirmCleanSheet: View {
     let items: [ScanItem]
     let totalBytes: Int64
+    /// 选中项是否包含废纸篓内容：这类条目会被永久删除，不可恢复。
+    var permanentlyDeletes: Bool = false
     let onConfirm: () -> Void
     let onCancel: () -> Void
 
@@ -611,15 +614,26 @@ struct ConfirmCleanSheet: View {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.system(size: 14, weight: .regular))
                     .foregroundStyle(M2.secondary)
-                Text("确认移入废纸篓")
+                Text(permanentlyDeletes ? "确认清理（含永久删除）" : "确认移入废纸篓")
                     .font(M2Font.serif(DesignSpec.sheetTitleSize))
                     .foregroundStyle(M2.text)
             }
 
-            Text("以下 \(items.count) 个项目共 \(ByteFormatter.string(totalBytes)) 将被移入废纸篓。移入后可随时从废纸篓恢复，O 不会执行永久删除。预计耗时 \(estimate.text)。")
-                .font(M2Font.body(11.5))
-                .foregroundStyle(M2.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if permanentlyDeletes {
+                Text("以下 \(items.count) 个项目共 \(ByteFormatter.string(totalBytes))：其中位于废纸篓的项目将被永久删除、不可恢复，其余项目移入废纸篓后仍可恢复。预计耗时 \(estimate.text)。")
+                    .font(M2Font.body(11.5))
+                    .foregroundStyle(M2.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("永久删除无法撤销，请确认这些文件不再需要。")
+                    .font(M2Font.body(11))
+                    .foregroundStyle(M2.danger)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("以下 \(items.count) 个项目共 \(ByteFormatter.string(totalBytes)) 将被移入废纸篓。移入后可随时从废纸篓恢复，O 不会执行永久删除。预计耗时 \(estimate.text)。")
+                    .font(M2Font.body(11.5))
+                    .foregroundStyle(M2.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: DesignSpec.space2) {
@@ -669,7 +683,7 @@ struct ConfirmCleanSheet: View {
                 Button("取消", action: onCancel)
                     .buttonStyle(M2SecondaryButtonStyle(compact: true))
                     .keyboardShortcut(.cancelAction)
-                Button("移入废纸篓", action: onConfirm)
+                Button(permanentlyDeletes ? "永久删除" : "移入废纸篓", action: onConfirm)
                     .buttonStyle(M2PrimaryButtonStyle(compact: true))
             }
         }

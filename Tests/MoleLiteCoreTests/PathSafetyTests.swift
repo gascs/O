@@ -67,9 +67,9 @@ final class PathSafetyTests: XCTestCase {
     }
 
     func testSymlinkInsideHomeIsAllowed() throws {
-        // 临时目录位于 /private 下，会被系统受保护前缀拦截；这里改用真实主目录内的临时沙盒。
-        let tempHome = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Caches/MoleLiteSymlink-\(UUID().uuidString)")
+        // 用临时目录模拟真实主目录，避免测试写真实 ~/Library。
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MoleLiteSymlink-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempHome) }
 
@@ -82,5 +82,39 @@ final class PathSafetyTests: XCTestCase {
 
         let tempSafety = PathSafety(homeDirectory: tempHome)
         XCTAssertTrue(tempSafety.verdict(for: link).isAllowed, "主目录内部的符号链接应被允许")
+    }
+
+    func testSymlinkPointingIntoProtectedLibraryIsRejected() throws {
+        // 旧实现会在「解析后仍在主目录内」时提前放行，导致 ~/Library 这类受保护目录被绕过。
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MoleLiteSymlink-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: tempHome) }
+
+        let caches = tempHome.appendingPathComponent("Library/Caches")
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        let link = caches.appendingPathComponent("into-library")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: tempHome.appendingPathComponent("Library")
+        )
+
+        let tempSafety = PathSafety(homeDirectory: tempHome)
+        XCTAssertFalse(tempSafety.verdict(for: link).isAllowed, "指向主目录内受保护目录的符号链接也应被拒绝")
+    }
+
+    func testForbiddenPathComparisonIsCaseInsensitive() {
+        // macOS 默认大小写不敏感，比较时不能区分大小写，否则 ~/library 能绕过。
+        XCTAssertFalse(safety.verdict(for: URL(fileURLWithPath: "/Users/TESTER/Library")).isAllowed)
+        XCTAssertFalse(safety.verdict(for: URL(fileURLWithPath: "/users/tester/library")).isAllowed)
+        XCTAssertFalse(safety.verdict(for: URL(fileURLWithPath: "/system/library")).isAllowed)
+    }
+
+    func testTemporaryHomeUnderVarIsAllowed() {
+        // 临时 home 位于 /var/folders（解析后是 /private/var），不应被 /var 受保护前缀误拦。
+        let tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MoleLiteSafety-\(UUID().uuidString)")
+        let tempSafety = PathSafety(homeDirectory: tempHome)
+        XCTAssertTrue(tempSafety.verdict(for: tempHome.appendingPathComponent("Library/Caches/com.example.app")).isAllowed)
+        XCTAssertFalse(tempSafety.verdict(for: URL(fileURLWithPath: "/var/db/anything")).isAllowed)
     }
 }

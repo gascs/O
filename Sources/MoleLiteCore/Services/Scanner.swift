@@ -90,16 +90,40 @@ public struct Scanner: Sendable {
         return result
     }
 
+    /// 单个目标最多展示的条目数；超过即截断并同步重算合计。
+    static let maximumItemsPerTarget = 300
+
+    /// 计算「被更具体根目录覆盖」的排除表。
+    ///
+    /// 同一批目标里，如果某个 root 严格位于另一个 root 之下（例如
+    /// `~/Library/Caches/Homebrew` 之于 `~/Library/Caches`），扫描上层 root 时必须跳过它，
+    /// 否则 userCaches 与 packageCaches / systemCaches 会重复统计同一批文件。
+    static func excludedRoots(for targets: [ScanTarget]) -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        for target in targets {
+            let rootPath = target.root.standardizedFileURL.path
+            let nested = targets.compactMap { other -> String? in
+                let otherPath = other.root.standardizedFileURL.path
+                guard otherPath != rootPath,
+                      PathSafety.isWithinCaseInsensitive(otherPath, prefix: rootPath) else { return nil }
+                return otherPath
+            }
+            if !nested.isEmpty { result[rootPath] = nested }
+        }
+        return result
+    }
+
     /// 执行扫描。重 IO 在 detached 任务中完成，不阻塞主线程。
     /// - Parameter progress: 后台线程回调，调用方自行切回主线程并节流。
     public func scan(categories: [ScanCategory] = ScanCategory.allCases,
                      cancellation: ScanCancellation = ScanCancellation(),
                      progress: @escaping @Sendable (ScanProgress) -> Void = { _ in }) async throws -> ScanReport {
         let targets = self.targets(for: categories)
+        let excludedRoots = Self.excludedRoots(for: targets)
         let start = Date()
         let settings = self.settings
 
-        return try await Task.detached(priority: .userInitiated) { [targets] in
+        return try await Task.detached(priority: .userInitiated) { [targets, excludedRoots] in
             let context = ScanContext(cancellation: cancellation, progress: progress)
             context.totalTargets = targets.count
 
@@ -114,7 +138,8 @@ public struct Scanner: Sendable {
 
                 let result: ScanCategoryResult
                 do {
-                    result = try self.scanTarget(target, settings: settings, context: context)
+                    result = try self.scanTarget(target, settings: settings, context: context,
+                                                 excludedRoots: excludedRoots[target.root.standardizedFileURL.path] ?? [])
                 } catch let error as ScanError {
                     throw error
                 } catch {
@@ -125,8 +150,19 @@ public struct Scanner: Sendable {
                 }
 
                 if var existing = merged[target.category] {
-                    existing.items.append(contentsOf: result.items)
-                    existing.totalBytes += result.totalBytes
+                    // 同分类多 root 合并时按路径去重，尽量不重复统计。
+                    var seen = Set(existing.items.map { $0.url.path.lowercased() })
+                    for item in result.items {
+                        if seen.insert(item.url.path.lowercased()).inserted {
+                            existing.items.append(item)
+                        }
+                    }
+                    if target.category == .largeFiles {
+                        // 大文件分类的 totalBytes 保留「全部命中文件之和」，items 只展示前 N 项。
+                        existing.totalBytes += result.totalBytes
+                    } else {
+                        existing.totalBytes = existing.items.reduce(0) { $0 + $1.byteSize }
+                    }
                     if existing.message == nil { existing.message = result.message }
                     existing.items.sort { $0.byteSize > $1.byteSize }
                     merged[target.category] = existing
@@ -150,7 +186,8 @@ public struct Scanner: Sendable {
 
     // MARK: - 单个目标
 
-    private func scanTarget(_ target: ScanTarget, settings: ScanSettings, context: ScanContext) throws -> ScanCategoryResult {
+    private func scanTarget(_ target: ScanTarget, settings: ScanSettings, context: ScanContext,
+                            excludedRoots: [String] = []) throws -> ScanCategoryResult {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: target.root.path, isDirectory: &isDirectory) else {
             // 受系统保护的位置在未授权时也会表现为「不存在」，给出可操作的说明而不是干巴巴的路径错误。
@@ -173,10 +210,14 @@ public struct Scanner: Sendable {
         let children = try contentsOfDirectory(target.root, includeHidden: settings.includeHiddenItems)
         var items: [ScanItem] = []
         var total: Int64 = 0
-        var skipped = 0
 
         for child in children {
             try context.tick(path: child.path)
+            // 跳过被更具体 root 覆盖的子目录，避免与 packageCaches / systemCaches 重复统计。
+            let childPath = child.standardizedFileURL.path
+            if excludedRoots.contains(where: { PathSafety.isWithinCaseInsensitive(childPath, prefix: $0) }) {
+                continue
+            }
             let values = try? child.resourceValues(forKeys: FileSizeReader.resourceKeys)
             if values?.isSymbolicLink == true { continue }
             let isDir = values?.isDirectory ?? false
@@ -190,15 +231,17 @@ public struct Scanner: Sendable {
                                       modifiedAt: values?.contentModificationDate))
                 total += size
             }
-            if items.count > 500 { skipped += 1 }
         }
 
         items.sort { $0.byteSize > $1.byteSize }
-        if items.count > 300 {
-            items = Array(items.prefix(300))
+        // 统一阈值：超过上限时截断，并同步重算 totalBytes，保证界面上的合计与实际条目一致。
+        guard items.count > Self.maximumItemsPerTarget else {
+            return ScanCategoryResult(category: target.category, items: items, totalBytes: total)
         }
-        let message: String? = skipped > 0 ? "结果已截断，仅展示前 300 项" : nil
-        return ScanCategoryResult(category: target.category, items: items, totalBytes: total, message: message)
+        items = Array(items.prefix(Self.maximumItemsPerTarget))
+        total = items.reduce(0) { $0 + $1.byteSize }
+        return ScanCategoryResult(category: target.category, items: items, totalBytes: total,
+                                  message: "结果已截断，仅展示前 \(Self.maximumItemsPerTarget) 项")
     }
 
     /// 第一层目录：统计总量，并把第二层子项聚合为可展开的明细。

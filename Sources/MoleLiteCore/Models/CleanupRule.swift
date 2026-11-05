@@ -139,6 +139,16 @@ public struct RuleValidation: Equatable, Sendable {
 /// 与 `PathSafety` 共用同一份系统受保护前缀；区别在于规则允许把
 /// `~/Downloads`、`~/.Trash` 这类目录作为**扫描根**，删除时仍逐条走 PathSafety。
 public enum RuleValidator {
+    /// 敏感目录（相对主目录）：整根本身及其子路径都不允许作为清理规则目标。
+    /// 这些位置存放密码、密钥、通信与账户数据，误删不可恢复。
+    public static let sensitiveRelativePaths: [String] = [
+        ".ssh", ".gnupg", ".aws", ".kube", ".config", ".docker", ".password-store",
+        "Library/Keychains", "Library/Messages", "Library/Mail", "Library/Safari",
+        "Library/Cookies", "Library/Accounts", "Library/Preferences",
+        "Library/IdentityServices", "Library/Calendars", "Library/Reminders",
+        "Library/Sharing", "Library/Suggestions"
+    ]
+
     public static func validate(path raw: String,
                                 home: URL,
                                 protectedPaths: [String] = []) -> RuleValidation {
@@ -150,25 +160,32 @@ public enum RuleValidator {
             return .reject("不能把整个主目录设为规则路径")
         }
         for prefix in PathSafety.protectedPrefixes
-        where PathSafety.isWithin(path, prefix: prefix) && !PathSafety.isWithin(path, prefix: homePath) {
+        where PathSafety.isWithinCaseInsensitive(path, prefix: prefix)
+            && !PathSafety.isWithinCaseInsensitive(path, prefix: homePath) {
             return .reject("系统受保护目录：\(prefix)")
         }
-        guard PathSafety.isWithin(path, prefix: homePath) else {
+        guard PathSafety.isWithinCaseInsensitive(path, prefix: homePath) else {
             return .reject("只允许用户主目录内的路径（当前：\(path)）")
         }
+        // 敏感目录（~/.ssh、~/Library/Keychains 等）：整根与子路径都拒绝。
+        if let sensitive = sensitiveRelativePaths.first(where: {
+            PathSafety.isWithinCaseInsensitive(path, prefix: homePath + "/" + $0)
+        }) {
+            return .reject("敏感目录：\(display(homePath + "/" + sensitive, home: home)) 内的数据不允许作为清理目标")
+        }
         // 只允许「主目录本身」之外，但拒绝范围过大的 ~/Library。
-        if path == homePath + "/Library" {
+        if path.lowercased() == (homePath + "/Library").lowercased() {
             return .reject("~/Library 范围过大，请选择具体子目录")
         }
         let normalizedProtected = protectedPaths
             .compactMap { RuleValidation.normalized($0, home: home) }
-        for entry in normalizedProtected where PathSafety.isWithin(path, prefix: entry) {
+        for entry in normalizedProtected where PathSafety.isWithinCaseInsensitive(path, prefix: entry) {
             return .reject("路径在受保护清单中：\(display(path, home: home))")
         }
         // 符号链接逃逸：解析后必须仍在主目录内。
         let resolved = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
         let resolvedHome = URL(fileURLWithPath: homePath).resolvingSymlinksInPath().path
-        if !PathSafety.isWithin(resolved, prefix: resolvedHome) {
+        if !PathSafety.isWithinCaseInsensitive(resolved, prefix: resolvedHome) {
             return .reject("符号链接指向主目录之外：\(resolved)")
         }
         return .ok
@@ -285,7 +302,7 @@ public enum CleanupRuleCatalog {
         CleanupRule(id: "sys.cache", name: "系统缓存副本", category: .systemCaches,
                     path: "~/Library/Caches/com.apple.LaunchServices", minAgeDays: 30, grade: .safe,
                     note: "LaunchServices 缓存副本，系统会自行重建。")
-    ]
+    ] + EcosystemRules.standard
 
     /// 激进预设：再加入个人文件、备份与容器数据，全部为「谨慎」级。
     public static let aggressive: [CleanupRule] = standard + [
@@ -310,7 +327,7 @@ public enum CleanupRuleCatalog {
         CleanupRule(id: "files.movies", name: "影片大文件", category: .userFiles,
                     path: "~/Movies", minAgeDays: 90, minSizeMB: 1000, grade: .caution,
                     note: "90 天以上未修改、单文件 ≥ 1 GB。", scanMode: .recursiveFiles)
-    ]
+    ] + EcosystemRules.aggressiveOnly
 
     public static func rules(for preset: RulePreset) -> [CleanupRule] {
         switch preset {
@@ -402,6 +419,8 @@ public struct RulesStore {
         var seen = Set<String>()
         let deduplicated = configuration.rules.map { rule -> CleanupRule in
             var copy = rule
+            // 导入的规则不允许保留 safe 级；个人文件类强制 caution。
+            copy.grade = Self.importedGrade(for: rule)
             if seen.contains(copy.id) { copy.id = UUID().uuidString }
             seen.insert(copy.id)
             return copy
@@ -454,6 +473,8 @@ public struct RulesStore {
                 continue
             }
             candidate.path = RuleValidation.normalized(candidate.path, home: home) ?? candidate.path
+            // 导入的规则不允许保留 safe 级；个人文件类强制 caution。
+            candidate.grade = Self.importedGrade(for: candidate)
             if seenPaths.contains(candidate.path) {
                 skippedDuplicates += 1
                 continue
@@ -485,6 +506,13 @@ public struct RulesStore {
                                      // 合并过就不再是一套纯预设。
                                      appliedPreset: nil)
         }
+    }
+
+    /// 导入时的安全等级归一化：不允许导入 safe（用户配置一律至少「建议」级），
+    /// 个人文件类规则强制 caution（清理后可能无法重建）。
+    static func importedGrade(for rule: CleanupRule) -> SafetyGrade {
+        if rule.category == .userFiles { return .caution }
+        return rule.grade == .safe ? .suggested : rule.grade
     }
 
     /// 保存前统一校验；返回第一条不合法原因。

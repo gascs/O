@@ -150,9 +150,23 @@ enum BrandAssets {
 
 enum AppInfo {
     static let displayName = "O"
-    static let version = "0.4.0"
     static let bundleIdentifier = "com.o.app"
     static let tagline = "磁盘清理与系统维护"
+
+    /// 版本号唯一来源是仓库根目录的 VERSION 文件；打包时由 build_app.sh 写入
+    /// Info.plist 的 CFBundleShortVersionString，这里优先读回，保证 App 内
+    /// 「设置 / 关于」与 Info.plist、VERSION、DMG 文件名完全一致。
+    /// `fallbackVersion` 用于未打包（swift run / XCTest）场景，必须与 VERSION 相同，
+    /// 不一致时 build_app.sh、build_dmg.sh、doctor.sh 都会报错。
+    static let fallbackVersion = "0.5.0"
+
+    static let version: String = {
+        if let value = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+           !value.isEmpty {
+            return value
+        }
+        return fallbackVersion
+    }()
 }
 
 /// 应用内品牌标识：与 App 图标同一母题——面板底 + 1px 细线 +

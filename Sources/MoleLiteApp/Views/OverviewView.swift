@@ -1,3 +1,4 @@
+import AppKit
 import MoleLiteCore
 import SwiftUI
 
@@ -220,6 +221,7 @@ struct OverviewView: View {
                 summaryRow("可用占比", model.disk.map { ByteFormatter.percent($0.availableFraction) } ?? "—")
                 summaryRow("累计释放", ByteFormatter.string(model.totalFreedBytes))
                 summaryRow("上次扫描", model.lastScanEntry.map { Self.timeFormatter.string(from: $0.date) } ?? "尚未扫描")
+                trashRow
             }
 
             if !model.categoryBreakdown.isEmpty {
@@ -255,11 +257,47 @@ struct OverviewView: View {
     }
 
     private var scopeRows: [(String, Int64)] {
-        let order: [ScanCategory] = [.userCaches, .logs, .xcode, .trash]
+        // 废纸篓单独一行只读展示（见 trashRow），不再计入「可清理」估算：
+        // 里面的内容可能还需要恢复，算成可释放空间会误导用户。
+        let order: [ScanCategory] = [.userCaches, .logs, .xcode]
         return order.compactMap { category in
             guard let bytes = model.categoryBreakdown[category], bytes > 0 else { return nil }
             return (category.title, bytes)
         }
+    }
+
+    /// 废纸篓大小的只读展示：后台探测（60 秒一次），不进可清理列表。
+    private var trashRow: some View {
+        HStack(spacing: DesignSpec.space2) {
+            // 标签与数值合成一个朗读单元，按钮保持独立可聚焦：否则整行会被合成
+            // 一个按钮，读屏用户找不到「在 Finder 中打开」这个动作。
+            HStack(spacing: DesignSpec.space2) {
+                Text("废纸篓")
+                    .font(M2Font.body(DesignSpec.captionSize))
+                    .foregroundStyle(M2.secondary)
+                Spacer(minLength: DesignSpec.space1)
+                M2Number(text: trashText, size: DesignSpec.captionSize, weight: .medium, unitColor: M2.tertiary)
+            }
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("废纸篓 \(trashText)")
+
+            Button("在 Finder 中打开") { openTrash() }
+                .buttonStyle(M2LinkButtonStyle())
+                .help("在 Finder 中查看废纸篓，可手动清空")
+                .accessibilityLabel("在 Finder 中打开废纸篓")
+        }
+        .frame(height: 24)
+    }
+
+    private var trashText: String {
+        guard let bytes = model.trashBytes else { return "统计中…" }
+        return bytes == 0 ? "空" : ByteFormatter.string(bytes)
+    }
+
+    private func openTrash() {
+        let trash = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".Trash").path
+        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: trash)
     }
 
     private func summaryRow(_ label: String, _ value: String) -> some View {
@@ -287,7 +325,7 @@ struct OverviewView: View {
 
             VStack(spacing: 0) {
                 if model.isEstimating && model.recommendations.isEmpty {
-                    M2ScanningState(title: "正在估算可清理空间", detail: "缓存 · 日志 · Xcode · 废纸篓", fraction: 0, rows: 3)
+                    M2ScanningState(title: "正在估算可清理空间", detail: "缓存 · 日志 · Xcode", fraction: 0, rows: 3)
                         .padding(16)
                 } else if let message = model.estimateMessage {
                     M2ErrorState(title: "估算失败", message: message, retry: { model.estimateCleanable() })
@@ -358,7 +396,7 @@ struct OverviewView: View {
             M2EmptyState(
                 icon: "checkmark.circle",
                 title: "暂时没有可安全清理的内容",
-                message: "扫描缓存、日志与废纸篓后，这里会按安全等级列出建议。",
+                message: "扫描缓存、日志与 Xcode 后，这里会按安全等级列出建议。",
                 actionTitle: "重新扫描",
                 action: goScan
             )

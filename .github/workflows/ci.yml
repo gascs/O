@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test (macOS 14)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        run: |
+          sw_vers
+          uname -m
+          xcodebuild -version
+          swift --version
+
+      - name: Run tests (XCTest + SelfTest)
+        run: bash run_tests.sh
+
+      - name: Build app bundle
+        run: bash build_app.sh
+
+      - name: Verify app bundle
+        run: |
+          set -euo pipefail
+          APP=".build/app/O.app"
+          test -d "$APP"
+          test -f "$APP/Contents/Resources/LICENSE"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          test "$PLIST_VERSION" = "$VERSION"
+          codesign --verify --deep --strict "$APP"
+          echo "O.app $VERSION 校验通过"
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: O-app-${{ github.sha }}
+          path: .build/app/O.app
+          if-no-files-found: error
+
+      - name: Build DMG (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: bash build_dmg.sh
+
+      - name: Upload DMG (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: O-dmg-${{ github.ref_name }}
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error

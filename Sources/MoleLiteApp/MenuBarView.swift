@@ -1,47 +1,265 @@
 import AppKit
+import Combine
 import MoleLiteCore
 import SwiftUI
 
+// MARK: - 历史摘要缓存
+
+/// 历史 / 趋势的派生摘要：一次解码出界面需要的全部字段。
+struct HistorySummary {
+    var recent: [HistoryEntry] = []
+    var totalFreedBytes: Int64 = 0
+    var lastScanEntry: HistoryEntry?
+    var trend: [DiskTrendPoint] = []
+
+    static let empty = HistorySummary()
+}
+
+/// 历史 / 趋势解码缓存：UserDefaults 里的原始 Data 没变化就绝不重复解码。
+///
+/// 原实现每个采样 tick 要解码 4 次（概览的 recent(6)、累计释放、上次扫描、趋势），
+/// 菜单栏再解码 1 次；200 条历史在主线程上每次约零点几毫秒。单次不致命，但它每 2 秒
+/// 就与 SwiftUI 绘制抢同一帧。这里把「原始 Data 是否变化」当缓存键：
+/// 只有真正扫描 / 清理写入后才会解码一次，其余 tick 只是一次 Data 比较。
+@MainActor
+final class HistorySummaryCache {
+    static let shared = HistorySummaryCache()
+
+    private let defaults = UserDefaults.standard
+    private var lastEntriesData: Data?
+    private var lastTrendData: Data?
+    private var cachedEntries: [HistoryEntry] = []
+    private var cachedTrend: [DiskTrendPoint] = []
+    private var summary = HistorySummary.empty
+
+    private init() {}
+
+    /// 读取摘要；底层数据没变时直接返回上次结果（O(1) 命中）。
+    func current() -> HistorySummary {
+        let entriesData = defaults.data(forKey: HistoryStore.Keys.entries)
+        let trendData = defaults.data(forKey: DiskTrendStore.Keys.points)
+        var dirty = false
+        if entriesData != lastEntriesData {
+            lastEntriesData = entriesData
+            cachedEntries = HistoryStore().load()
+            dirty = true
+        }
+        if trendData != lastTrendData {
+            lastTrendData = trendData
+            cachedTrend = DiskTrendStore().points()
+            dirty = true
+        }
+        guard dirty else { return summary }
+
+        summary.recent = Array(cachedEntries.prefix(6))
+        summary.totalFreedBytes = cachedEntries
+            .filter { $0.kind == .clean }
+            .reduce(0) { $0 + $1.bytes }
+        summary.lastScanEntry = cachedEntries.first { $0.kind == .scan }
+        let calendar = Calendar.current
+        let cutoff = calendar.startOfDay(for: calendar.date(byAdding: .day, value: -6, to: Date()) ?? Date())
+        summary.trend = cachedTrend.filter { $0.day >= cutoff }
+        return summary
+    }
+}
+
+// MARK: - 统一采样中心
+
+/// 全 App 唯一的系统采样中心：主窗口概览与菜单栏共用同一份快照、同一条采样循环。
+///
+/// 改造前的两条独立循环：
+/// - OverviewViewModel：2 秒一次，在主线程同步读 IOKit / getifaddrs / 磁盘 / 历史 JSON；
+/// - MenuBarMonitor：5 秒一次，同样在主线程再读一遍相同的指标。
+/// 两者不仅重复读，读的还是同一条「贵」路径。现在采样本体在 `SystemSampler`
+///（actor，后台执行器）里完成，主线程只接收一个不可变快照并赋值；
+/// 采样频率按「谁需要更密」取最小值（概览页 2 秒），两处显示永远同一时刻的快照。
+@MainActor
+final class SharedSystemMonitor: ObservableObject {
+    static let shared = SharedSystemMonitor()
+
+    @Published private(set) var sample: SystemSample = .empty
+    @Published private(set) var historySummary: HistorySummary = .empty
+    @Published private(set) var trashBytes: Int64?
+
+    private let sampler = SystemSampler()
+    private let historyCache = HistorySummaryCache.shared
+
+    private var loopTask: Task<Void, Never>?
+    private var wakeTask: Task<Void, Never>?
+    private var isSampling = false
+    private var overviewActive = false
+    private var lastTrendDay: Date?
+    private var lastTrendRecordAt: Date?
+    private var lastTrashProbeAt: Date?
+
+    private init() {}
+
+    /// 概览页出现 / 消失时调用：决定采样频率档位，并立刻补一次采样。
+    func setOverviewActive(_ active: Bool) {
+        guard overviewActive != active else { return }
+        overviewActive = active
+        refreshNow()
+    }
+
+    func start() {
+        guard loopTask == nil else { return }
+        if sample.disk == nil {
+            // 首帧先给磁盘一次廉价同步读（一次 URLResourceValues，约 1ms），
+            // 避免菜单栏 / 概览出现「读取中…」闪一下；其余指标由首次后台采样补齐。
+            var seeded = sample
+            seeded.disk = DiskService().snapshot()
+            sample = seeded
+        }
+        loopTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                await self.sampleOnce()
+                guard !Task.isCancelled else { return }
+                let interval = self.currentInterval()
+                let wake = Task {
+                    _ = try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                }
+                self.wakeTask = wake
+                await wake.value
+                self.wakeTask = nil
+            }
+        }
+    }
+
+    /// 立即唤醒循环采样：进入概览、设置变更、手动刷新都走这里。
+    func refreshNow() {
+        guard loopTask != nil else {
+            start()
+            return
+        }
+        // 取消正在等待的 sleep，循环会立刻进入下一次采样；正在采样时无需重复排队。
+        wakeTask?.cancel()
+        wakeTask = nil
+    }
+
+    /// 设置里改了刷新间隔后重启节奏：不重建循环，只缩短当前等待。
+    func restartLoop() {
+        refreshNow()
+    }
+
+    private func sampleOnce() async {
+        guard !isSampling else { return }
+        isSampling = true
+        let snapshot = await sampler.sample()
+        apply(snapshot)
+        isSampling = false
+    }
+
+    private func apply(_ snapshot: SystemSample) {
+        sample = snapshot
+        maybeRecordTrend(snapshot.disk)
+        historySummary = historyCache.current()
+        maybeProbeTrash()
+    }
+
+    /// 磁盘趋势写入：DiskTrendStore.record 是「解码全部点 → 替换当天点 → 编码写 UserDefaults」，
+    /// 原来概览与菜单栏每 2~5 秒各调一次（每 tick 两次解码+编码+写盘）。
+    /// 现在跨天必记一次，同一天最多每 30 分钟刷新当天数据点，兼顾趋势准确度与写入成本。
+    private func maybeRecordTrend(_ disk: DiskSnapshot?) {
+        guard let disk else { return }
+        let now = Date()
+        let today = Calendar.current.startOfDay(for: now)
+        let dayChanged = lastTrendDay != today
+        guard dayChanged || now.timeIntervalSince(lastTrendRecordAt ?? .distantPast) > 1800 else { return }
+        lastTrendDay = today
+        lastTrendRecordAt = now
+        DiskTrendStore().record(disk, on: now)
+    }
+
+    /// 废纸篓体积变化慢，每 60 秒在后台统计一次；只读，不参与可清理估算。
+    private func maybeProbeTrash() {
+        let now = Date()
+        guard now.timeIntervalSince(lastTrashProbeAt ?? .distantPast) > 60 else { return }
+        lastTrashProbeAt = now
+        // 递归枚举 ~/.Trash 放到后台线程；detached 任务不捕获 self，
+        // 只把 Int64 结果带回主线程赋值（避免在并发闭包里持有 MainActor 对象）。
+        let probe = Task.detached(priority: .utility) { TrashSizeProbe().size() }
+        Task { [weak self] in
+            let size = await probe.value
+            self?.trashBytes = size
+        }
+    }
+
+    /// 采样间隔：取各处需求里最密的那个。
+    private func currentInterval() -> TimeInterval {
+        let base = ScanSettings.menuBarRefreshInterval()
+        if overviewActive {
+            // 概览页要连续曲线：默认 2 秒；用户把菜单栏设得更快时跟随设置。
+            // 窗口最小化 / 关闭时退到 10 秒，避免后台空转（与原概览循环一致）。
+            return isMainWindowVisible ? min(base, 2) : 10
+        }
+        if isMainWindowVisible {
+            return base
+        }
+        // 主窗口与概览都不可见时降频到 2.5 倍（上限 60 秒）。
+        return min(60, max(10, base * 2.5))
+    }
+
+    /// 主窗口是否可见。窗口关闭 / 最小化时降低采样频率。
+    private var isMainWindowVisible: Bool {
+        NSApp.windows.contains { $0.isVisible && $0.canBecomeMain && !$0.isMiniaturized }
+    }
+}
+
+// MARK: - 菜单栏监控（共享采样器的轻量适配器）
+
 /// 菜单栏常驻监控：磁盘、内存、CPU、网络、电池与最近一次扫描结果。
+///
+/// 这里不再自己采样，只是 `SharedSystemMonitor` 的展示适配器：
+/// - 数据来源统一：主窗口与菜单栏看到的是同一时刻的快照，两个数字不会对不上；
+/// - 暂停时冻结在按下暂停那一刻的快照，面板数字不再继续跳；
+/// - 对外保留原有属性 / 方法（refresh / restartLoop / style / isPaused 等），
+///   调用方（SettingsView、RootView、MenuBarPanel）无需改动。
 @MainActor
 final class MenuBarMonitor: ObservableObject {
-    @Published private(set) var disk: DiskSnapshot?
-    @Published private(set) var memory: MemorySnapshot?
-    @Published private(set) var cpuUsage: Double = 0
-    @Published private(set) var cpuHistory: [Double] = []
-    @Published private(set) var network: NetworkRate = .zero
-    @Published private(set) var battery: BatterySnapshot = .absent
-    @Published private(set) var lastScanBytes: Int64 = 0
-    @Published private(set) var lastScanDate: Date?
     @Published private(set) var style: MenuBarDisplayStyle = .iconAndPercent
     @Published var isPaused = false
 
-    private var networkSampler = NetworkSampler()
-    private var lastCPUSample: CPUSample?
-    private var loopTask: Task<Void, Never>?
-    private var lastTrendDay: Date?
-    private let diskService = DiskService()
-    private let metrics = SystemMetricsService()
-    private let batteryService = BatteryService()
+    private let shared = SharedSystemMonitor.shared
+    private var cancellables: Set<AnyCancellable> = []
+    private var frozenSample: SystemSample?
+    private var frozenHistory: HistorySummary?
 
     init() {
         style = ScanSettings.menuBarStyle()
-        refresh()
-        startLoop()
+        bind()
+        shared.start()
     }
 
+    private var currentSample: SystemSample {
+        isPaused ? (frozenSample ?? shared.sample) : shared.sample
+    }
+
+    private var currentHistory: HistorySummary {
+        isPaused ? (frozenHistory ?? shared.historySummary) : shared.historySummary
+    }
+
+    var disk: DiskSnapshot? { currentSample.disk }
+    var memory: MemorySnapshot? { currentSample.memory }
+    var cpuUsage: Double { currentSample.cpuUsage }
+    var cpuHistory: [Double] { currentSample.cpuHistory }
+    var network: NetworkRate { currentSample.network }
+    var battery: BatterySnapshot { currentSample.battery }
+    var lastScanBytes: Int64 { currentHistory.lastScanEntry?.bytes ?? 0 }
+    var lastScanDate: Date? { currentHistory.lastScanEntry?.date }
+
     var percentText: String {
-        guard let disk else { return "—" }
+        guard let disk = disk else { return "—" }
         return ByteFormatter.percent(disk.usedFraction)
     }
 
     var diskHeadline: String {
-        guard let disk else { return "读取中…" }
+        guard let disk = disk else { return "读取中…" }
         return ByteFormatter.string(disk.usedBytes)
     }
 
     var diskCaption: String {
-        guard let disk else { return "" }
+        guard let disk = disk else { return "" }
         return "共 \(ByteFormatter.string(disk.totalBytes)) · 可用 \(ByteFormatter.string(disk.availableBytes))"
     }
 
@@ -50,65 +268,41 @@ final class MenuBarMonitor: ObservableObject {
         return ByteFormatter.string(lastScanBytes)
     }
 
+    /// 兼容原有调用方（设置页、RootView 刷新）：只唤醒共享采样器，读不再阻塞主线程。
     func refresh() {
-        disk = diskService.snapshot()
-        memory = metrics.memory()
-        if let sample = metrics.cpuSample() {
-            if let previous = lastCPUSample {
-                let usage = sample.usage(since: previous)
-                cpuUsage = usage
-                cpuHistory.append(usage)
-                if cpuHistory.count > 40 { cpuHistory.removeFirst(cpuHistory.count - 40) }
-            }
-            lastCPUSample = sample
-        }
-        network = networkSampler.sample() ?? network
-        battery = batteryService.snapshot()
         style = ScanSettings.menuBarStyle()
-
-        let recent = HistoryStore().load().first { $0.kind == .scan }
-        lastScanBytes = recent?.bytes ?? 0
-        lastScanDate = recent?.date
-
-        recordTrendIfNeeded()
-    }
-
-    private func recordTrendIfNeeded() {
-        guard let disk else { return }
-        let today = Calendar.current.startOfDay(for: Date())
-        guard lastTrendDay != today else { return }
-        lastTrendDay = today
-        DiskTrendStore().record(disk)
+        if isPaused {
+            // 暂停状态下的「刷新」只更新冻结值，不恢复自动刷新（保持原语义）。
+            frozenSample = shared.sample
+            frozenHistory = shared.historySummary
+        }
+        shared.refreshNow()
     }
 
     func togglePause() {
         isPaused.toggle()
-        if !isPaused { refresh() }
+        if isPaused {
+            frozenSample = shared.sample
+            frozenHistory = shared.historySummary
+        } else {
+            frozenSample = nil
+            frozenHistory = nil
+            shared.refreshNow()
+        }
     }
 
     func restartLoop() {
-        startLoop()
+        shared.restartLoop()
     }
 
-    /// 主窗口是否可见。窗口关闭 / 最小化时降低菜单栏采样频率，避免无谓占用。
-    private var isMainWindowVisible: Bool {
-        NSApp.windows.contains { $0.isVisible && $0.canBecomeMain && !$0.isMiniaturized }
-    }
-
-    private func startLoop() {
-        loopTask?.cancel()
-        loopTask = Task { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-                let base = ScanSettings.menuBarRefreshInterval()
-                // 主窗口不可见时把采样间隔拉长到 2.5 倍（上限 60 秒），与主窗口刷新完全解耦。
-                let interval = self.isMainWindowVisible ? base : min(60, base * 2.5)
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                guard !self.isPaused else { continue }
-                self.refresh()
+    /// 把共享采样器的变化转发成自己的 objectWillChange：
+    /// 面板订阅的是 monitor，所以共享快照一到就要重绘。
+    private func bind() {
+        shared.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
-        }
+            .store(in: &cancellables)
     }
 }
 

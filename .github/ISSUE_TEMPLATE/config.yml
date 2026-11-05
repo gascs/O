@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私密上报）
+    url: https://github.com/gascs/O/security/advisories/new
+    about: 请勿用公开 Issue 报告安全问题，按 SECURITY.md 的流程私密上报。
+  - name: 使用问题与讨论
+    url: https://github.com/gascs/O/discussions
+    about: 安装、权限、规则等使用问题请先到 Discussions 搜索或提问。
+  - name: 贡献代码前先读 CONTRIBUTING
+    url: https://github.com/gascs/O/blob/main/CONTRIBUTING.md
+    about: 构建、测试、新增规则与截图重生成的完整说明。

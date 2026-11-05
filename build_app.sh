@@ -1,41 +1,85 @@
 #!/usr/bin/env bash
 # 构建 O.app（macOS 13+，SwiftUI）
+#
 # 用法：
 #   ./build_app.sh          构建 .app
 #   ./build_app.sh --open   构建后立即打开
+#
+# 版本号唯一来源：仓库根目录 VERSION 文件。
+#   - Info.plist 的 CFBundleShortVersionString 直接来自 VERSION
+#   - CFBundleVersion 由 VERSION 换算（0.5.0 → 500）
+#   - Sources/MoleLiteApp/Views/Components.swift 的 fallbackVersion 必须与 VERSION 相同，
+#     否则本脚本直接报错退出（避免 App 内版本与安装包版本漂移）
+#
+# 产物：.build/app/O.app（默认 universal：arm64 + x86_64）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="O"
 BUNDLE_ID="com.o.app"
-VERSION="0.4.0"
 BUILD_DIR="$ROOT/.build/app"
 APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 SDK="$(xcrun --show-sdk-path)"
 TARGET="$(uname -m)-apple-macos13.0"
+# 受限环境（沙箱 / CI）下 SwiftPM 自己的构建沙箱可能无法写临时目录，默认关闭；
+# 需要保留 SwiftPM 沙箱时设 O_SWIFT_SANDBOX=1。
+SWIFT_FLAGS=(--disable-sandbox)
+if [ "${O_SWIFT_SANDBOX:-0}" = "1" ]; then
+    SWIFT_FLAGS=()
+fi
 
 mkdir -p "$BUILD_DIR"
 
 fail() {
     echo "" >&2
     echo "构建失败：$1" >&2
-    echo "日志：$2" >&2
-    echo "建议：运行 bash doctor.sh 查看工具链状态；SwiftPM 为主要路径，失败时会自动回退 swiftc。" >&2
+    if [ -n "${2:-}" ]; then echo "日志：$2" >&2; fi
+    echo "建议：运行 bash doctor.sh 查看工具链状态。" >&2
     exit 1
 }
 
-# 自动探测 SwiftPM 是否可用。清单不可用时（例如工具链未完整安装），
-# swift build 会在编译 manifest 阶段失败，这里提前识别并走 swiftc。
+# ---------------------------------------------------------------------------
+# 0. 版本号：VERSION 是唯一来源；Components.swift 只允许跟随，不允许分歧
+# ---------------------------------------------------------------------------
+VERSION_FILE="$ROOT/VERSION"
+[ -f "$VERSION_FILE" ] || fail "缺少 VERSION 文件（仓库根目录），无法确定版本号"
+VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+case "$VERSION" in
+    [0-9]*.[0-9]*.[0-9]*) ;;
+    *) fail "VERSION 内容不是合法的 x.y.z 版本号：'$VERSION'" ;;
+esac
+
+COMPONENTS_FILE="$ROOT/Sources/MoleLiteApp/Views/Components.swift"
+[ -f "$COMPONENTS_FILE" ] || fail "缺少 $COMPONENTS_FILE"
+COMPONENTS_VERSION="$(sed -nE 's/.*static let (fallbackVersion|version) = "([^"]+)".*/\2/p' "$COMPONENTS_FILE" | head -1)"
+if [ -z "$COMPONENTS_VERSION" ]; then
+    fail "无法从 Components.swift 解析版本号常量（fallbackVersion），请确认 AppInfo 未被改动"
+fi
+if [ "$COMPONENTS_VERSION" != "$VERSION" ]; then
+    fail "版本号不一致：VERSION=$VERSION，Components.swift=$COMPONENTS_VERSION（请同步修改后重试）"
+fi
+
+# CFBundleVersion：把 x.y.z 换算成单调递增的整数（0.5.0 → 500）
+IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$VERSION"
+BUILD_NUMBER=$(( 10#${V_MAJOR:-0} * 10000 + 10#${V_MINOR:-0} * 100 + 10#${V_PATCH:-0} ))
+
+echo "==> 版本：$VERSION（CFBundleVersion $BUILD_NUMBER，来源 VERSION）"
+
+# ---------------------------------------------------------------------------
+# 1. 构建可执行文件：优先 SwiftPM universal，其次 SwiftPM 本机架构，
+#    最后回退 swiftc 直编。任何回退都会显式报错，不再静默降级。
+# ---------------------------------------------------------------------------
 SWIFTPM_OK=0
-if swift package --package-path "$ROOT" dump-package > "$BUILD_DIR/swift-package-probe.log" 2>&1; then
+# 注意：必须带 --disable-sandbox，否则受限环境（沙箱 / CI 容器）里
+# 清单编译会被 sandbox-exec 拒绝（sandbox_apply: Operation not permitted）。
+if swift package --disable-sandbox --package-path "$ROOT" dump-package \
+        > "$BUILD_DIR/swift-package-probe.log" 2>&1; then
     SWIFTPM_OK=1
 fi
 
-# ---------------------------------------------------------------------------
 # 仅装 Command Line Tools 时，CLT 自带的 module.modulemap 与 bridging.modulemap
 # 同时定义了 SwiftBridging，会让所有 swiftc 编译报 "redefinition of module"。
 # 这里用一个 VFS overlay 把重复的 modulemap 隐藏掉（仅在该环境下启用）。
-# ---------------------------------------------------------------------------
 EXTRA_FLAGS=()
 CLT_HEADER="/Library/Developer/CommandLineTools/usr/include/swift"
 if [ "$(xcode-select -p 2>/dev/null || true)" = "/Library/Developer/CommandLineTools" ] \
@@ -60,20 +104,69 @@ APP_SOURCES=(
 )
 CORE_SOURCES=("$ROOT"/Sources/MoleLiteCore/Models/*.swift "$ROOT"/Sources/MoleLiteCore/Services/*.swift)
 
-# ---------------------------------------------------------------------------
-# 1. 构建可执行文件：优先 swift build，失败时回退到 swiftc 直编
-# ---------------------------------------------------------------------------
 BINARY=""
-if [ "$SWIFTPM_OK" = "1" ] && swift build -c release --package-path "$ROOT" > "$BUILD_DIR/swift-build.log" 2>&1; then
-    BINARY="$(swift build -c release --package-path "$ROOT" --show-bin-path)/$APP_NAME"
-    BUILD_MODE="SwiftPM (swift build -c release)"
-else
-    if [ "$SWIFTPM_OK" = "0" ]; then
-        echo "==> SwiftPM 清单不可用，回退到 swiftc 直接编译"
+BUILD_MODE=""
+UNIVERSAL=0
+
+if [ "$SWIFTPM_OK" = "1" ]; then
+    # SwiftPM 6.0.3 没有 `--arch` 选项（`swift build --help` 只有 --triple），
+    # 因此 universal 用两次 --triple 交叉构建 + lipo 合并；任何一步失败都显式报错再回退。
+    echo "==> 编译 release：arm64 + x86_64（分别 --triple，再用 lipo 合并为 universal）"
+    ARM_SCRATCH="$BUILD_DIR/universal-arm64"
+    X86_SCRATCH="$BUILD_DIR/universal-x86_64"
+    ARM_LOG="$BUILD_DIR/swift-build-arm64.log"
+    X86_LOG="$BUILD_DIR/swift-build-x86_64.log"
+    ARM_BIN=""
+    X86_BIN=""
+    if swift build -c release --package-path "$ROOT" \
+            --triple arm64-apple-macosx13.0 --scratch-path "$ARM_SCRATCH" \
+            "${SWIFT_FLAGS[@]}" > "$ARM_LOG" 2>&1; then
+        ARM_BIN="$(swift build -c release --package-path "$ROOT" \
+            --triple arm64-apple-macosx13.0 --scratch-path "$ARM_SCRATCH" \
+            --show-bin-path 2>/dev/null)/$APP_NAME"
     else
-        echo "==> swift build 失败（详见 .build/app/swift-build.log），回退到 swiftc 直接编译"
+        echo "!! arm64 构建失败，详见 $ARM_LOG" >&2
     fi
-    BUILD_MODE="swiftc 直接编译（无需 Xcode）"
+    if [ -x "$ARM_BIN" ]; then
+        if swift build -c release --package-path "$ROOT" \
+                --triple x86_64-apple-macosx13.0 --scratch-path "$X86_SCRATCH" \
+                "${SWIFT_FLAGS[@]}" > "$X86_LOG" 2>&1; then
+            X86_BIN="$(swift build -c release --package-path "$ROOT" \
+                --triple x86_64-apple-macosx13.0 --scratch-path "$X86_SCRATCH" \
+                --show-bin-path 2>/dev/null)/$APP_NAME"
+        else
+            echo "!! x86_64 构建失败，详见 $X86_LOG" >&2
+        fi
+    fi
+    if [ -x "$ARM_BIN" ] && [ -x "$X86_BIN" ]; then
+        if lipo -create -output "$BUILD_DIR/$APP_NAME-universal" "$ARM_BIN" "$X86_BIN" \
+                > "$BUILD_DIR/lipo.log" 2>&1; then
+            BINARY="$BUILD_DIR/$APP_NAME-universal"
+            BUILD_MODE="SwiftPM (universal: arm64 + x86_64)"
+            UNIVERSAL=1
+        else
+            echo "!! lipo 合并 universal 失败，详见 $BUILD_DIR/lipo.log" >&2
+        fi
+    fi
+    if [ "$UNIVERSAL" != "1" ]; then
+        echo "!! universal 构建不可用：回退为本机架构（$(uname -m)），产物不是 universal，请勿直接用于发布。" >&2
+        echo "==> 编译 release（本机架构 $(uname -m)）"
+        if swift build -c release --package-path "$ROOT" \
+                "${SWIFT_FLAGS[@]}" > "$BUILD_DIR/swift-build.log" 2>&1; then
+            BINARY="$(swift build -c release --package-path "$ROOT" --show-bin-path 2>/dev/null)/$APP_NAME"
+            BUILD_MODE="SwiftPM（回退：本机 $(uname -m)）"
+        else
+            echo "!! 本机架构 swift build 也失败，回退到 swiftc 直接编译" >&2
+            SWIFTPM_OK=0
+        fi
+    fi
+else
+    echo "==> SwiftPM 清单不可用，回退到 swiftc 直接编译"
+fi
+
+if [ "$SWIFTPM_OK" = "0" ]; then
+    BUILD_MODE="swiftc 直接编译（回退：本机 $(uname -m)）"
+    UNIVERSAL=0
 
     NEED_COMPILE=1
     if [ -x "$BUILD_DIR/$APP_NAME" ] \
@@ -107,19 +200,48 @@ else
 fi
 
 if [ ! -x "$BINARY" ]; then
-    echo "构建失败：找不到可执行文件 $BINARY" >&2
-    exit 1
+    fail "找不到可执行文件 $BINARY"
 fi
 echo "==> 构建方式：$BUILD_MODE"
 
+# universal 声明校验：构建方式说 universal，就真的必须是 fat binary
+if [ "$UNIVERSAL" = "1" ]; then
+    LIPO_INFO="$(lipo -info "$BINARY" 2>/dev/null || true)"
+    if printf '%s' "$LIPO_INFO" | grep -q "arm64" && printf '%s' "$LIPO_INFO" | grep -q "x86_64"; then
+        echo "==> 架构校验：$(printf '%s' "$LIPO_INFO" | sed 's/^Architectures in the fat file: //')"
+    else
+        echo "!! 架构校验失败：预期 universal（arm64 + x86_64），实际：${LIPO_INFO:-未知}" >&2
+        echo "!! 产物将按单架构继续打包；发布前请修复通用构建。" >&2
+        UNIVERSAL=0
+    fi
+fi
+
 # ---------------------------------------------------------------------------
-# 2. 组装 .app
+# 2. 组装 .app（清理旧 bundle 前先做路径校验）
 # ---------------------------------------------------------------------------
+case "$APP_BUNDLE" in
+    "$ROOT"/.build/app/*.app) ;;
+    *)
+        echo "!! 路径校验失败，拒绝删除：$APP_BUNDLE" >&2
+        exit 1
+        ;;
+esac
+if [ -z "$APP_BUNDLE" ] || [ "$APP_BUNDLE" = "/" ] || [ "$APP_BUNDLE" = "$HOME" ]; then
+    echo "!! 路径校验失败，拒绝删除：$APP_BUNDLE" >&2
+    exit 1
+fi
 rm -rf "$APP_BUNDLE"
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp "$BINARY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 chmod +x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 printf 'APPL????' > "$APP_BUNDLE/Contents/PkgInfo"
+
+# LICENSE 进 App bundle：分发单个 .app 时也能看到许可证（DMG 里同样放一份）
+if [ -f "$ROOT/LICENSE" ]; then
+    cp "$ROOT/LICENSE" "$APP_BUNDLE/Contents/Resources/LICENSE"
+else
+    echo "!! 未找到 LICENSE，App bundle 内将不含许可证" >&2
+fi
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -129,7 +251,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
-    <string>O</string>
+    <string>$APP_NAME</string>
     <key>CFBundleExecutable</key>
     <string>$APP_NAME</string>
     <key>CFBundleIconFile</key>
@@ -145,7 +267,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key>
     <string>$VERSION</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>$BUILD_NUMBER</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
@@ -186,16 +308,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Ad-hoc 签名（本机运行足够；分发需自行换 Developer ID）
+# 4. 签名：有 Developer ID 就用（含 hardened runtime）；没有就 ad-hoc，
+#    失败绝不静默——打印原因并继续产出可用但未公证的 .app。
 # ---------------------------------------------------------------------------
-codesign --force --sign - "$APP_BUNDLE" > /dev/null 2>&1 || true
-codesign --verify --verbose=1 "$APP_BUNDLE" > /dev/null 2>&1 && SIGN_STATE="已做 ad-hoc 签名" || SIGN_STATE="签名校验失败"
+SIGN_IDENTITY="${O_CODESIGN_IDENTITY:-}"
+if [ -z "$SIGN_IDENTITY" ] && command -v security > /dev/null 2>&1; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -nE 's/.*"(Developer ID Application[^"]*)".*/\1/p' | head -1)"
+fi
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY="-"
+    SIGN_HINT="ad-hoc（未找到 Developer ID Application 证书；首次打开需在系统设置中允许）"
+else
+    SIGN_HINT="Developer ID Application：$SIGN_IDENTITY"
+fi
 
-echo "==> $SIGN_STATE"
+if codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE" > "$BUILD_DIR/codesign.log" 2>&1; then
+    echo "==> 签名：$SIGN_HINT"
+else
+    echo "!! 使用 '$SIGN_IDENTITY' 签名失败（详见 $BUILD_DIR/codesign.log）" >&2
+    echo "!! 尝试 ad-hoc 签名作为兜底……" >&2
+    if codesign --force --sign - "$APP_BUNDLE" >> "$BUILD_DIR/codesign.log" 2>&1; then
+        SIGN_HINT="ad-hoc（签名兜底成功；未使用 Developer ID，未公证）"
+        echo "==> 签名：$SIGN_HINT"
+    else
+        SIGN_HINT="未签名（codesign 失败，产物仍可本机运行）"
+        echo "!! codesign 失败：$SIGN_HINT；详见 $BUILD_DIR/codesign.log" >&2
+    fi
+fi
+
+if codesign --verify --verbose=2 "$APP_BUNDLE" > "$BUILD_DIR/codesign-verify.log" 2>&1; then
+    echo "==> 签名校验：通过"
+else
+    echo "!! 签名校验未通过（详见 $BUILD_DIR/codesign-verify.log）：产物可本机运行，但 Gatekeeper 会拦截分发。" >&2
+fi
+if printf '%s' "$SIGN_HINT" | grep -q "ad-hoc\|未签名"; then
+    echo "==> 公证：未公证（ad-hoc 签名无法公证）。公开发布需 Developer ID + notarytool。"
+fi
+
 echo ""
 echo "构建完成："
 echo "  .app      : $APP_BUNDLE"
+echo "  版本      : $VERSION（CFBundleVersion $BUILD_NUMBER）"
+echo "  架构      : $([ "$UNIVERSAL" = "1" ] && echo "universal（arm64 + x86_64）" || echo "单架构（$(uname -m)）")"
 echo "  可执行文件: $APP_BUNDLE/Contents/MacOS/$APP_NAME"
+echo "  许可证    : $APP_BUNDLE/Contents/Resources/LICENSE"
 echo ""
 echo "启动方式： open \"$APP_BUNDLE\""
 

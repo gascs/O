@@ -35,6 +35,9 @@ final class ScanViewModel: ObservableObject {
         var id: String { url.path }
     }
 
+    /// 清理行动共用的安全校验（也用于判断选中项是否落在废纸篓内）。
+    private let safety = PathSafety()
+
     private var scanTask: Task<Void, Never>?
     private var searchTask: Task<Void, Never>?
     private var cancellation: ScanCancellation?
@@ -55,6 +58,14 @@ final class ScanViewModel: ObservableObject {
     }
 
     var selectedBytes: Int64 { selectedItems.reduce(0) { $0 + $1.byteSize } }
+
+    /// 选中项里是否包含废纸篓内容：这类条目无法再「移入废纸篓」，只能永久删除，界面需要额外警告。
+    var selectionIncludesTrash: Bool { containsTrashItems(selectedItems) }
+
+    private func containsTrashItems(_ items: [ScanItem]) -> Bool {
+        let trashPath = safety.homeDirectory.appendingPathComponent(".Trash").path
+        return items.contains { PathSafety.isWithinCaseInsensitive($0.url.path, prefix: trashPath) }
+    }
 
     var suggestedGroup: RecommendationGroup? {
         recommendations.first { $0.grade == .safe || $0.grade == .suggested }
@@ -371,7 +382,7 @@ final class ScanViewModel: ObservableObject {
         let bytes = items.reduce(Int64(0)) { $0 + $1.byteSize }
         cleanEstimate = estimator.cleanEstimate(items: items.count, bytes: bytes)
         cleanProgress = (0, items.count)
-        let report = await performTrash(items)
+        let report = await performTrash(items, allowPermanentRemoval: containsTrashItems(items))
         isCleaning = false
         apply(cleanReport: report)
     }
@@ -384,16 +395,16 @@ final class ScanViewModel: ObservableObject {
         cleanEstimate = estimator.cleanEstimate(items: items.count,
                                                bytes: items.reduce(Int64(0)) { $0 + $1.byteSize })
         cleanProgress = (0, items.count)
-        let report = await performTrash(items)
+        let report = await performTrash(items, allowPermanentRemoval: containsTrashItems(items))
         isCleaning = false
         apply(cleanReport: report)
     }
 
-    private func performTrash(_ items: [ScanItem]) async -> CleanReport {
+    private func performTrash(_ items: [ScanItem], allowPermanentRemoval: Bool = false) async -> CleanReport {
         let service = TrashService()
         let started = Date()
         let report = await Task.detached(priority: .userInitiated) { [weak self] in
-            service.trash(items: items, progress: { completed, total in
+            service.trash(items: items, allowPermanentRemoval: allowPermanentRemoval, progress: { completed, total in
                 Task { @MainActor in
                     self?.cleanProgress = (completed, total)
                 }
@@ -432,15 +443,26 @@ final class ScanViewModel: ObservableObject {
         }
 
         if cleanReport.bytesFreed > 0 {
+            let detail: String
+            if cleanReport.freedBytes > 0 && cleanReport.movedBytes > 0 {
+                detail = "移入废纸篓与永久删除"
+            } else if cleanReport.freedBytes > 0 {
+                detail = "永久删除"
+            } else {
+                detail = "移入废纸篓"
+            }
             HistoryStore().append(HistoryEntry(
                 kind: .clean,
                 bytes: cleanReport.bytesFreed,
                 itemCount: cleanReport.successCount,
-                detail: "移入废纸篓"
+                detail: detail
             ))
         }
 
         var lines: [String] = [cleanReport.summary, "释放 \(ByteFormatter.string(cleanReport.bytesFreed))"]
+        if cleanReport.hasPermanentDeletion {
+            lines.append("其中永久删除 \(ByteFormatter.string(cleanReport.freedBytes))，不可恢复；移入废纸篓 \(ByteFormatter.string(cleanReport.movedBytes))，可从废纸篓恢复。")
+        }
         cleanHasPermissionIssue = cleanReport.hasPermissionIssue
         if cleanReport.hasPermissionIssue {
             lines.append("有项目因权限不足无法移动。可在「系统设置 › 隐私与安全性 › 完全磁盘访问」中勾选 O 后重试。")

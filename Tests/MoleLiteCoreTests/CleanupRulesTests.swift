@@ -5,9 +5,9 @@ final class CleanupRulesTests: XCTestCase {
     private var tempHome: URL!
 
     override func setUpWithError() throws {
-        // 放在真实主目录下，确保 PathSafety 的「允许范围」与系统前缀校验都能覆盖。
-        tempHome = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".o-rules-tests-\(UUID().uuidString)")
+        // 用临时目录模拟主目录，避免测试写真实 $HOME（沙箱下也没有写入权限）。
+        tempHome = FileManager.default.temporaryDirectory
+            .appendingPathComponent("O-RulesTests-home-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempHome, withIntermediateDirectories: true)
     }
 
@@ -16,9 +16,9 @@ final class CleanupRulesTests: XCTestCase {
     }
 
     func testPresetHierarchyAndEnabledCounts() {
+        // 具体数量随规则库演进（生态缓存规则会持续补充），这里只校验层级关系与约束；
+        // 发布前的准确数量由集成侧核对。
         XCTAssertEqual(CleanupRuleCatalog.conservative.count, 5)
-        XCTAssertEqual(CleanupRuleCatalog.standard.count, 26)
-        XCTAssertEqual(CleanupRuleCatalog.aggressive.count, 33)
         XCTAssertGreaterThan(CleanupRuleCatalog.standard.count, CleanupRuleCatalog.conservative.count)
         XCTAssertGreaterThan(CleanupRuleCatalog.aggressive.count, CleanupRuleCatalog.standard.count)
         XCTAssertTrue(CleanupRuleCatalog.aggressive.allSatisfy { rule in
@@ -251,6 +251,65 @@ final class CleanupRulesTests: XCTestCase {
         XCTAssertTrue(summary.rejectedRules.contains { $0.reason.contains("受保护") || $0.reason.contains("系统") })
         XCTAssertTrue(summary.rejectedRules.contains { $0.reason == "规则名称不能为空" })
         XCTAssertTrue(summary.hasFindings)
+    }
+
+    func testValidatorRejectsSensitiveDirectories() {
+        let cases = [
+            tempHome.appendingPathComponent(".ssh").path,
+            tempHome.appendingPathComponent(".ssh/id_ed25519").path,
+            tempHome.appendingPathComponent("Library/Keychains").path,
+            tempHome.appendingPathComponent("Library/Messages/chat.db").path,
+            tempHome.appendingPathComponent("Library/Mail").path,
+            tempHome.appendingPathComponent("Library/Safari").path,
+            tempHome.appendingPathComponent("Library/Cookies").path,
+            tempHome.appendingPathComponent("Library/Accounts").path,
+            tempHome.appendingPathComponent("Library/Preferences").path,
+            tempHome.appendingPathComponent("Library/Preferences/com.apple.finder.plist").path,
+            tempHome.appendingPathComponent(".gnupg").path,
+            tempHome.appendingPathComponent(".aws").path,
+            tempHome.appendingPathComponent(".kube").path,
+            tempHome.appendingPathComponent(".config").path,
+            tempHome.appendingPathComponent(".docker").path
+        ]
+        for path in cases {
+            let verdict = RuleValidator.validate(path: path, home: tempHome)
+            XCTAssertFalse(verdict.isValid, "敏感目录不应通过校验：\(path)")
+            XCTAssertTrue(verdict.reason?.contains("敏感目录") == true,
+                          "\(path) 的拒绝原因应说明敏感目录，实际：\(verdict.reason ?? "nil")")
+        }
+    }
+
+    func testValidatorKeepsNormalCachePathsAllowedAfterSensitivityCheck() {
+        let cases = [
+            tempHome.appendingPathComponent("Library/Caches").path,
+            tempHome.appendingPathComponent("Library/Caches/com.example.app").path,
+            tempHome.appendingPathComponent(".npm/_cacache").path,
+            tempHome.appendingPathComponent(".cache/bazel").path,
+            tempHome.appendingPathComponent("Library/Logs").path
+        ]
+        for path in cases {
+            XCTAssertTrue(RuleValidator.validate(path: path, home: tempHome).isValid, "常规缓存路径应允许：\(path)")
+        }
+    }
+
+    func testImportDowngradesSafeGradesAndForcesCautionForUserFiles() throws {
+        let store = RulesStore(home: tempHome)
+        let safeCache = CleanupRule(name: "安全缓存", category: .userCaches,
+                                    path: tempHome.appendingPathComponent("Library/Caches").path,
+                                    grade: .safe)
+        let safeUserFile = CleanupRule(name: "个人文件", category: .userFiles,
+                                       path: tempHome.appendingPathComponent("Downloads").path,
+                                       grade: .safe)
+        let source = CleanupRulesConfiguration(rules: [safeCache, safeUserFile])
+        let data = try RulesStore.exportJSON(source)
+
+        let imported = try store.importJSON(data)
+        XCTAssertEqual(imported.rules.first?.grade, .suggested, "导入后不允许保留 safe 等级")
+        XCTAssertEqual(imported.rules.last?.grade, .caution, "个人文件类规则导入后必须降为 caution")
+
+        let summary = try store.importRules(data, mode: .replace)
+        XCTAssertEqual(summary.acceptedRules.first?.grade, .suggested)
+        XCTAssertEqual(summary.acceptedRules.last?.grade, .caution)
     }
 
     func testMergeImportDeduplicatesPathsAndMergesProtectedPaths() throws {

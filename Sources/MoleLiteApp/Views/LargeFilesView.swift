@@ -16,31 +16,13 @@ struct LargeFilesView: View {
         return permissions.snapshot.fullDiskAccessStatus == .denied && !coordinator.allowLimitedScan
     }
 
-    private enum SortKey {
-        case name, location, type, modified, size
-    }
-
-    @State private var sortKey: SortKey = .size
+    /// 排序交给 ViewModel 做并缓存：SwiftUI 每次重算 body（悬停、勾选、进度刷新）
+    /// 都不再对最多 500 行做全量排序，比较器也改成了严格弱序。
+    @State private var sortKey: LargeFileColumnSort = .size
     @State private var descending = true
 
     private var items: [ScanItem] {
-        let filtered = model.filteredItems
-        return filtered.sorted { lhs, rhs in
-            let result: Bool
-            switch sortKey {
-            case .name:
-                result = lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-            case .location:
-                result = lhs.url.path.localizedStandardCompare(rhs.url.path) == .orderedAscending
-            case .type:
-                result = lhs.fileExtension.localizedStandardCompare(rhs.fileExtension) == .orderedAscending
-            case .modified:
-                result = (lhs.modifiedAt ?? .distantPast) < (rhs.modifiedAt ?? .distantPast)
-            case .size:
-                result = lhs.byteSize < rhs.byteSize
-            }
-            return descending ? !result : result
-        }
+        model.columnSortedItems(for: sortKey, descending: descending)
     }
 
     var body: some View {
@@ -131,6 +113,14 @@ struct LargeFilesView: View {
                         .foregroundStyle(M2.tertiary)
                     M2Number(text: ByteFormatter.string(model.totalBytes), size: 10, weight: .medium, unitColor: M2.tertiary)
                 }
+                // 结果被截断时（Scanner 只返回前 500 项）把提示放在总数旁，
+                // 否则用户看到的项数与体积合计对不上，也无从知道还有更多文件。
+                if let message = model.message, !message.contains("失败"), !message.contains("错误") {
+                    Text(message)
+                        .font(M2Font.body(10))
+                        .foregroundStyle(M2.tertiary)
+                        .lineLimit(1)
+                }
             }
 
             Spacer(minLength: DesignSpec.space2)
@@ -218,7 +208,7 @@ struct LargeFilesView: View {
         .overlay(alignment: .bottom) { Hairline() }
     }
 
-    private func headerButton(_ title: String, key: SortKey, alignment: Alignment) -> some View {
+    private func headerButton(_ title: String, key: LargeFileColumnSort, alignment: Alignment) -> some View {
         Button {
             if sortKey == key {
                 descending.toggle()
@@ -374,10 +364,16 @@ struct LargeFilesView: View {
         return path
     }
 
-    static func dateText(_ date: Date?) -> String {
-        guard let date else { return "—" }
+    /// 复用同一个 DateFormatter：旧实现每行每次都新建一个，500 行滚动/勾选时
+    /// 每秒可能创建上千个 DateFormatter（ICU 初始化很贵），是真实的主线程卡顿来源。
+    private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm"
-        return formatter.string(from: date)
+        return formatter
+    }()
+
+    static func dateText(_ date: Date?) -> String {
+        guard let date else { return "—" }
+        return dateFormatter.string(from: date)
     }
 }

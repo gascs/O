@@ -122,7 +122,7 @@ let package = Package(
 )
 PKG
     printf 'print("ok")\n' > "$TMP/pkg/Sources/T/main.swift"
-    if swift package --package-path "$TMP/pkg" dump-package > "$TMP/dump.json" 2> "$TMP/dump.err"; then
+    if swift package --disable-sandbox --package-path "$TMP/pkg" dump-package > "$TMP/dump.json" 2> "$TMP/dump.err"; then
         SWIFTPM_OK=1
         ok "SwiftPM 可用（swift build / swift test 可尝试）"
     else
@@ -176,15 +176,28 @@ fi
 echo ""
 echo "7) 登录启动"
 APP_PATH="$ROOT/.build/app/O.app"
+INSTALLED_APP="/Applications/O.app"
 if [ -d "$APP_PATH" ]; then
-    info "已构建：$APP_PATH"
-    if [ "$APP_PATH" = "/Applications/O.app" ]; then
-        ok "O.app 位于「应用程序」文件夹"
-    else
-        bad "O.app 不在 /Applications" "把 O.app 拖入「应用程序」后再在 O 设置里开启「登录时自动打开」"
-    fi
+    info "源码目录内已构建：$APP_PATH"
 else
     bad "尚未构建 O.app" "运行 ./build_app.sh"
+fi
+if [ -d "$INSTALLED_APP" ]; then
+    ok "O.app 位于「应用程序」文件夹" "登录项只在 App 位于 /Applications 时可靠工作"
+    INSTALLED_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+        "$INSTALLED_APP/Contents/Info.plist" 2>/dev/null || true)"
+    if [ -d "$APP_PATH" ]; then
+        BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
+        if [ -n "$INSTALLED_VERSION" ] && [ "$INSTALLED_VERSION" != "$BUILT_VERSION" ]; then
+            bad "已安装版本（${INSTALLED_VERSION:-未知}）与刚构建版本（${BUILT_VERSION:-未知}）不一致" \
+                "重新运行 ./build_dmg.sh 并用新 DMG 覆盖安装，避免旧版残留"
+        else
+            ok "已安装版本与构建产物一致（${INSTALLED_VERSION:-未知}）"
+        fi
+    fi
+else
+    info "未在 /Applications 找到 O.app" "需要开机自启时，把 O.app 拖入「应用程序」后再在 O 设置里开启「登录时自动打开」"
 fi
 BTM_DUMP="$(sfltool dumpbtm 2>&1 || true)"
 if printf '%s' "$BTM_DUMP" | grep -q "com.o.app"; then
@@ -235,7 +248,71 @@ else
     info "废纸篓：目录不存在，无法判定" "不会被当成已授权"
 fi
 
+# 9. 版本号与发布产物
+echo ""
+echo "9) 版本号与发布产物"
+VERSION_FILE="$ROOT/VERSION"
+if [ -f "$VERSION_FILE" ]; then
+    VERSION="$(tr -d '[:space:]' < "$VERSION_FILE")"
+    if [ -n "$VERSION" ]; then
+        ok "VERSION 存在且非空：$VERSION"
+    else
+        bad "VERSION 为空" "写入形如 0.5.0 的版本号（唯一版本来源）"
+    fi
+else
+    VERSION=""
+    bad "缺少 VERSION 文件" "在仓库根目录创建 VERSION，内容为当前版本号（如 0.5.0）"
+fi
+COMPONENTS_VERSION=""
+COMPONENTS_FILE="$ROOT/Sources/MoleLiteApp/Views/Components.swift"
+if [ -f "$COMPONENTS_FILE" ]; then
+    COMPONENTS_VERSION="$(sed -nE 's/.*static let (fallbackVersion|version) = "([^"]+)".*/\2/p' \
+        "$COMPONENTS_FILE" | head -1)"
+fi
+if [ -z "$COMPONENTS_VERSION" ]; then
+    bad "无法从 Components.swift 解析版本号" "检查 AppInfo.fallbackVersion 是否为字符串字面量"
+elif [ -n "$VERSION" ] && [ "$COMPONENTS_VERSION" != "$VERSION" ]; then
+    bad "Components.swift 版本（$COMPONENTS_VERSION）与 VERSION（$VERSION）不一致" \
+        "build_app.sh 会因此直接失败；把两者改成同一版本号"
+else
+    ok "Components.swift 版本与 VERSION 一致（${COMPONENTS_VERSION}）"
+fi
+if [ -d "$APP_PATH" ] && [ -n "$VERSION" ]; then
+    PLIST_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+        "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
+    if [ "$PLIST_VERSION" = "$VERSION" ]; then
+        ok "构建产物 Info.plist 版本一致（${PLIST_VERSION}）"
+    else
+        bad "构建产物 Info.plist 版本（${PLIST_VERSION:-未知}）与 VERSION（$VERSION）不一致" \
+            "重新运行 ./build_app.sh"
+    fi
+fi
+if [ -n "$VERSION" ]; then
+    DMG_PATH="$ROOT/dist/O-$VERSION.dmg"
+    SHA_PATH="$DMG_PATH.sha256"
+    if [ -f "$DMG_PATH" ]; then
+        ok "已生成 $DMG_PATH" "大小：$(du -h "$DMG_PATH" | cut -f1 | xargs)"
+        if [ -f "$SHA_PATH" ]; then
+            if ( cd "$ROOT/dist" && shasum -a 256 -c "$(basename "$SHA_PATH")" > /dev/null 2>&1 ); then
+                ok "DMG 的 SHA-256 校验通过（$(basename "$SHA_PATH")）"
+            else
+                bad "DMG 的 SHA-256 校验失败" "DMG 可能被改动或未完整生成；重新运行 ./build_dmg.sh"
+            fi
+        else
+            bad "缺少 $(basename "$SHA_PATH")" "重新运行 ./build_dmg.sh 生成校验文件"
+        fi
+    else
+        info "尚未生成 O-$VERSION.dmg（发布前运行 ./build_dmg.sh）"
+    fi
+fi
+
 echo ""
 echo "============================================================"
 printf '摘要：%d 项正常，%d 项异常\n' "$OK_COUNT" "$BAD_COUNT"
 echo "说明：本脚本只做读取与临时目录内的编译探针，不 sudo、不修改系统设置、不删除用户文件。"
+if [ "$BAD_COUNT" -gt 0 ]; then
+    echo "结论：存在 ${BAD_COUNT} 项异常，请按「建议」处理；本脚本以非零退出码结束。"
+    exit 1
+fi
+echo "结论：全部检查通过。"
+

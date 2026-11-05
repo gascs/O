@@ -1,0 +1,102 @@
+name: 问题反馈
+description: 报告 O 的 Bug 或异常行为
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。提交前请先看 [常见问题](https://github.com/gascs/O#常见问题) 与
+        已有的 [Issues](https://github.com/gascs/O/issues?q=is%3Aissue)。
+        **请勿在公开 Issue 中粘贴完整磁盘路径中的私人信息，或任何密钥、令牌。**
+        安全漏洞请按 [SECURITY.md](https://github.com/gascs/O/blob/main/SECURITY.md) 私密上报。
+
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS 版本
+      description: 打开「系统设置 › 通用 › 关于本机」复制版本号。
+      placeholder: 例：macOS 15.1 (24B83)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: architecture
+    attributes:
+      label: 芯片架构
+      options:
+        - Apple Silicon（arm64）
+        - Intel（x86_64）
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: O 版本
+      description: 在 O 的「设置 › 关于」中查看，或右键 O.app › 显示简介。
+      placeholder: 例：0.5.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: full-disk-access
+    attributes:
+      label: 是否已授予「完全磁盘访问」
+      description: 系统设置 › 隐私与安全性 › 完全磁盘访问。未授权时部分分类会显示受限，这是预期行为。
+      options:
+        - 已授权
+        - 未授权
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: preset
+    attributes:
+      label: 使用的规则预设
+      description: 保守 / 标准 / 激进，或「自定义」。
+      placeholder: 例：标准（47 条规则）
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 O，进入「扫描」
+        2. 选择标准预设，点击扫描
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断信息（可选）
+      description: |
+        在终端运行 `bash doctor.sh`，把以 `[异常]` 开头的行贴在这里（其余可省略）。
+        如涉及自定义规则，可附上「设置 › 规则 › 导出」得到的 JSON（请先删掉私人路径）。
+      render: shell
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图或录屏（可选）
+      description: 拖入图片即可。涉及个人文件名的部分请打码。
