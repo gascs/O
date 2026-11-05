@@ -27,7 +27,9 @@ final class PermissionCenter: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             // 用户可能刚在系统设置里授权完切回来，重新实测一次。
-            Task { @MainActor in self?.refresh() }
+            // Swift 5.10 不允许把 weak 捕获的 var 带进并发闭包，这里先绑定为 let。
+            guard let owner = self else { return }
+            Task { @MainActor in owner.refresh() }
         }
     }
 

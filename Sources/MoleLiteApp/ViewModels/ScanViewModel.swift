@@ -403,10 +403,11 @@ final class ScanViewModel: ObservableObject {
     private func performTrash(_ items: [ScanItem], allowPermanentRemoval: Bool = false) async -> CleanReport {
         let service = TrashService()
         let started = Date()
-        let report = await Task.detached(priority: .userInitiated) { [weak self] in
+        let owner = self
+        let report = await Task.detached(priority: .userInitiated) {
             service.trash(items: items, allowPermanentRemoval: allowPermanentRemoval, progress: { completed, total in
                 Task { @MainActor in
-                    self?.cleanProgress = (completed, total)
+                    owner.cleanProgress = (completed, total)
                 }
             })
         }.value
