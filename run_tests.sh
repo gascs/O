@@ -53,8 +53,11 @@ swift build --package-path "$ROOT" --disable-sandbox ${SCRATCH_ARGS[@]+"${SCRATC
 if [ "$build_exit" -eq 0 ]; then
     echo "    App target 编译通过"
 else
-    echo "    App target 编译失败（详见 $BUILD_LOG）"
-    sed -n '1,20p' "$BUILD_LOG" | sed 's/^/    /'
+    echo "    App target 编译失败（详见 ${BUILD_LOG}）"
+    grep -E "error:" "$BUILD_LOG" | head -20 | sed 's/^/    /' || true
+    sed -n '1,40p' "$BUILD_LOG" | sed 's/^/    /'
+    echo "    ……（构建日志末尾）"
+    tail -n 15 "$BUILD_LOG" | sed 's/^/    /'
 fi
 
 # ---------------------------------------------------------------- 1) XCTest
@@ -73,7 +76,7 @@ if [ -n "$xctest_line" ]; then
     echo "    XCTest：${xctest_count} 个用例，${xctest_failures} 失败"
 else
     xctest_failures="?"
-    echo "    XCTest：未产生结果（exit=${xctest_exit}，详见 $XCTEST_LOG）"
+    echo "    XCTest：未产生结果（exit=${xctest_exit}，详见 ${XCTEST_LOG}）"
     sed -n '1,20p' "$XCTEST_LOG" | sed 's/^/    /'
 fi
 if [ "$xctest_exit" -ne 0 ] && [ "$xctest_failures" = "0" ]; then
@@ -107,7 +110,7 @@ selftest_line="$(grep -E "结果：[0-9]+ 通过，[0-9]+ 失败" "$SELFTEST_LOG
 if [ -n "$selftest_line" ]; then
     echo "    SelfTest：$selftest_line"
 else
-    echo "    SelfTest：未产生结果（exit=${selftest_exit}，详见 $SELFTEST_LOG）"
+    echo "    SelfTest：未产生结果（exit=${selftest_exit}，详见 ${SELFTEST_LOG}）"
 fi
 
 # ---------------------------------------------------------------- 汇总

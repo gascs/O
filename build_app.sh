@@ -56,14 +56,14 @@ if [ -z "$COMPONENTS_VERSION" ]; then
     fail "无法从 Components.swift 解析版本号常量（fallbackVersion），请确认 AppInfo 未被改动"
 fi
 if [ "$COMPONENTS_VERSION" != "$VERSION" ]; then
-    fail "版本号不一致：VERSION=$VERSION，Components.swift=$COMPONENTS_VERSION（请同步修改后重试）"
+    fail "版本号不一致：VERSION=${VERSION}，Components.swift=${COMPONENTS_VERSION}（请同步修改后重试）"
 fi
 
 # CFBundleVersion：把 x.y.z 换算成单调递增的整数（0.5.0 → 500）
 IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$VERSION"
 BUILD_NUMBER=$(( 10#${V_MAJOR:-0} * 10000 + 10#${V_MINOR:-0} * 100 + 10#${V_PATCH:-0} ))
 
-echo "==> 版本：$VERSION（CFBundleVersion $BUILD_NUMBER，来源 VERSION）"
+echo "==> 版本：${VERSION}（CFBundleVersion ${BUILD_NUMBER}，来源 VERSION）"
 
 # ---------------------------------------------------------------------------
 # 1. 构建可执行文件：优先 SwiftPM universal，其次 SwiftPM 本机架构，
@@ -333,7 +333,7 @@ else
         echo "==> 签名：$SIGN_HINT"
     else
         SIGN_HINT="未签名（codesign 失败，产物仍可本机运行）"
-        echo "!! codesign 失败：$SIGN_HINT；详见 $BUILD_DIR/codesign.log" >&2
+        echo "!! codesign 失败：${SIGN_HINT}；详见 $BUILD_DIR/codesign.log" >&2
     fi
 fi
 
@@ -349,7 +349,7 @@ fi
 echo ""
 echo "构建完成："
 echo "  .app      : $APP_BUNDLE"
-echo "  版本      : $VERSION（CFBundleVersion $BUILD_NUMBER）"
+echo "  版本      : ${VERSION}（CFBundleVersion ${BUILD_NUMBER}）"
 echo "  架构      : $([ "$UNIVERSAL" = "1" ] && echo "universal（arm64 + x86_64）" || echo "单架构（$(uname -m)）")"
 echo "  可执行文件: $APP_BUNDLE/Contents/MacOS/$APP_NAME"
 echo "  许可证    : $APP_BUNDLE/Contents/Resources/LICENSE"

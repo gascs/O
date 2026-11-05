@@ -272,7 +272,7 @@ fi
 if [ -z "$COMPONENTS_VERSION" ]; then
     bad "无法从 Components.swift 解析版本号" "检查 AppInfo.fallbackVersion 是否为字符串字面量"
 elif [ -n "$VERSION" ] && [ "$COMPONENTS_VERSION" != "$VERSION" ]; then
-    bad "Components.swift 版本（$COMPONENTS_VERSION）与 VERSION（$VERSION）不一致" \
+    bad "Components.swift 版本（${COMPONENTS_VERSION}）与 VERSION（${VERSION}）不一致" \
         "build_app.sh 会因此直接失败；把两者改成同一版本号"
 else
     ok "Components.swift 版本与 VERSION 一致（${COMPONENTS_VERSION}）"
@@ -283,7 +283,7 @@ if [ -d "$APP_PATH" ] && [ -n "$VERSION" ]; then
     if [ "$PLIST_VERSION" = "$VERSION" ]; then
         ok "构建产物 Info.plist 版本一致（${PLIST_VERSION}）"
     else
-        bad "构建产物 Info.plist 版本（${PLIST_VERSION:-未知}）与 VERSION（$VERSION）不一致" \
+        bad "构建产物 Info.plist 版本（${PLIST_VERSION:-未知}）与 VERSION（${VERSION}）不一致" \
             "重新运行 ./build_app.sh"
     fi
 fi

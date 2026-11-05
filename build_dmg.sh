@@ -28,18 +28,18 @@ if [ -z "$COMPONENTS_VERSION" ]; then
     exit 1
 fi
 if [ "$COMPONENTS_VERSION" != "$VERSION" ]; then
-    echo "!! 版本号不一致：VERSION=$VERSION，Components.swift=$COMPONENTS_VERSION" >&2
+    echo "!! 版本号不一致：VERSION=${VERSION}，Components.swift=$COMPONENTS_VERSION" >&2
     exit 1
 fi
 
 DMG_PATH="$DIST_DIR/$APP_NAME-$VERSION.dmg"
 SHA_PATH="$DMG_PATH.sha256"
 
-echo "==> 构建 $APP_NAME.app（版本 $VERSION）"
+echo "==> 构建 $APP_NAME.app（版本 ${VERSION}）"
 bash "$ROOT/build_app.sh"
 
 if [ ! -d "$APP_PATH" ]; then
-    echo "!! 未找到 $APP_PATH，构建可能失败。" >&2
+    echo "!! 未找到 ${APP_PATH}，构建可能失败。" >&2
     exit 1
 fi
 
@@ -47,7 +47,7 @@ fi
 BUILT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
     "$APP_PATH/Contents/Info.plist" 2>/dev/null || true)"
 if [ "$BUILT_VERSION" != "$VERSION" ]; then
-    echo "!! .app 内版本（${BUILT_VERSION:-未知}）与 VERSION（$VERSION）不一致，退出。" >&2
+    echo "!! .app 内版本（${BUILT_VERSION:-未知}）与 VERSION（${VERSION}）不一致，退出。" >&2
     exit 1
 fi
 if [ ! -f "$APP_PATH/Contents/Resources/LICENSE" ]; then
