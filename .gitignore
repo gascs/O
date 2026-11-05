@@ -1,0 +1,19 @@
+# 构建产物
+.build/
+dist/
+*.dmg
+
+# Xcode / DerivedData
+DerivedData/
+xcuserdata/
+*.xcodeproj
+*.xcworkspace
+.swiftpm/
+
+# 系统文件
+.DS_Store
+*.swp
+*~
+
+# 本地临时文件
+*.log
